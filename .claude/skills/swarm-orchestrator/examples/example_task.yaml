@@ -1,0 +1,28 @@
+# Пример задачи для роя. goal — обязателен. tasks — опционально: если пусто, Менеджер
+# разложит goal сам первым вызовом (тратит один вызов opus, но не требует ручной разбивки).
+#
+# verify_cmd — реальная shell-команда, которую Приёмщик выполнит САМ на этой машине перед
+# тем как поверить, что задача сделана. Без verify_cmd приёмка идёт только по слову агента.
+
+goal: >
+  Написать функцию is_prime(n) на Python с юнит-тестами и коротким README,
+  положить в ./out/prime.py и ./out/test_prime.py.
+
+allow_paid: false        # платные модели (раздел 3) не трогать без явного true
+cost_cap: 1.00            # $ — предохранитель, раздел 8
+max_iterations: 6
+
+tasks:
+  - id: implement
+    goal: >
+      Реализовать is_prime(n) в out/prime.py: корректно для n<2, простых и составных,
+      без внешних зависимостей.
+    kind: implement
+    deps: []
+    verify_cmd: "python -c \"import sys; sys.path.insert(0,'out'); from prime import is_prime; assert not is_prime(1); assert is_prime(2); assert is_prime(97); assert not is_prime(100)\""
+
+  - id: tests
+    goal: "Написать pytest-тесты для is_prime в out/test_prime.py, покрыть границы и составные числа."
+    kind: implement
+    deps: [implement]
+    verify_cmd: "cd out && python -m pytest test_prime.py -q"
