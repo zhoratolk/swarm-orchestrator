@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -39,7 +40,44 @@ def load_config(path: Path) -> dict:
     cfg.setdefault("allow_paid", False)
     cfg.setdefault("cost_cap", None)
     cfg.setdefault("max_iterations", 6)
+    cfg.setdefault("repo_context", [])  # список glob-паттернов исходников для Менеджера/Диспетчера/агентов
     return cfg
+
+
+REPO_CONTEXT_LIMIT = 400_000  # символов — щедрый запас под 1M-контекст free-моделей, но не безлимит
+
+
+def build_repo_context(globs: list[str], root: Path) -> str:
+    """Читает файлы по glob-паттернам (относительно root) и склеивает в один текст с fenced-блоками,
+    чтобы Менеджер/Диспетчер/агенты видели реальный код целевого репозитория, а не только текст задачи
+    из YAML. Раньше рой не мог сам себя чинить: у него физически не было способа прочитать swarm/*.py —
+    задачу приходилось вручную вклеивать в goal одного таска, что не масштабируется на планирование."""
+    if not globs:
+        return ""
+    parts = []
+    total = 0
+    seen: set[Path] = set()
+    for pattern in globs:
+        for match in sorted(glob.glob(str(root / pattern), recursive=True)):
+            p = Path(match)
+            if not p.is_file() or p in seen:
+                continue
+            seen.add(p)
+            try:
+                content = p.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            rel = p.relative_to(root)
+            block = f"### {rel.as_posix()}\n```\n{content}\n```\n"
+            if total + len(block) > REPO_CONTEXT_LIMIT:
+                log.warning("repo_context: лимит %d символов достигнут, %s и далее пропущены",
+                            REPO_CONTEXT_LIMIT, rel)
+                break
+            parts.append(block)
+            total += len(block)
+    if not parts:
+        return ""
+    return "Исходники целевого репозитория (для справки, не для дословного пересказа):\n\n" + "\n".join(parts)
 
 
 def write_artifacts(artifacts: list[dict]) -> None:
@@ -109,8 +147,8 @@ ROLE_MAX_TOKENS = {"implementer": 8192, "checker": 8192, "specialist": 8192}
 
 
 def run_wave(gateway, requests_: list[SpawnRequest], task: Task, board: Board, models_of,
-             workers: int = 6) -> list[AgentReply]:
-    extra = dep_context(board, task)
+             repo_context: str = "", workers: int = 6) -> list[AgentReply]:
+    extra = (repo_context + "\n\n" + dep_context(board, task)) if repo_context else dep_context(board, task)
     calls = []
     for req in requests_:
         models = models_of(req.role)
@@ -141,7 +179,7 @@ def run_wave(gateway, requests_: list[SpawnRequest], task: Task, board: Board, m
 
 
 def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
-                  allow_paid: bool) -> None:
+                  allow_paid: bool, repo_context: str = "") -> None:
     def models_of(role: str) -> list[str]:
         models = ROLE_MODEL_DEFAULTS.get(role, ["gpt-6-sol"])
         if not allow_paid:
@@ -152,7 +190,7 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
 
     task.status = "dispatched"
     task.log("dispatch")
-    plan = dispatcher_plan(gateway, task, board)
+    plan = dispatcher_plan(gateway, task, board, repo_context)
     approved: list[SpawnRequest] = []
     for req in plan:
         verdict = auditor.review(req, task)
@@ -169,7 +207,7 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
         return
 
     task.status = "in_progress"
-    replies = run_wave(gateway, approved, task, board, models_of)
+    replies = run_wave(gateway, approved, task, board, models_of, repo_context)
     if not replies:
         task.status = "blocked"
         task.findings.append({"severity": "blocker", "what": "волна не вернула ни одного ответа",
@@ -193,7 +231,7 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
         if verdict.approved_count > 0:
             checker_replies = run_wave(gateway, [SpawnRequest("checker", verdict.approved_count,
                                                                 checker_req.reason, task.id)],
-                                        task, board, models_of)
+                                        task, board, models_of, repo_context)
             for r in checker_replies:
                 task.findings += r.findings
                 task.log("checker_reply", model=r.model, status=r.status)
@@ -257,6 +295,9 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
 def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
     setup_logging(run_dir)
     cfg = load_config(config_path)
+    repo_context = build_repo_context(cfg["repo_context"], Path.cwd())
+    if repo_context:
+        log.info("repo_context: %d символов кода передано Менеджеру/Диспетчеру/агентам", len(repo_context))
 
     usage = Usage()
     gateway = FakeGateway(usage) if dry_run else Gateway(usage)
@@ -274,7 +315,7 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
         board = Board.new(tasks, board_path)
     else:
         log.info("задач в конфиге нет — Менеджер раскладывает цель сам")
-        tasks = manager_decompose(gateway, cfg["goal"])
+        tasks = manager_decompose(gateway, cfg["goal"], repo_context)
         board = Board.new(tasks, board_path)
     board.save()
 
@@ -294,7 +335,7 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
 
         for task in ready:
             log.info("задача %s: %s", task.id, task.goal[:120])
-            process_task(gateway, auditor, task, board, cfg["allow_paid"])
+            process_task(gateway, auditor, task, board, cfg["allow_paid"], repo_context)
             board.save()
 
         blockers = board.blockers()
@@ -317,7 +358,7 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
             # раньше сюда шли только what/where — reject reject reject без сути; менеджер честно отвечал
             # "недостаточно контекста" и цикл топтался. Теперь fix/причина едет тоже.
             summary = "; ".join(f"{b.get('what')} ({b.get('where')}): {b.get('fix', '')}" for b in blockers[:5])
-            decision = manager_replan(gateway, board, summary)
+            decision = manager_replan(gateway, board, summary, repo_context)
             log.info("менеджер: %s", decision)
             for t in board.tasks.values():
                 if t.status == "blocked":
