@@ -85,11 +85,27 @@ def dep_context(board: Board, task: Task) -> str:
         for a in dt.artifacts:
             if a.get("content"):
                 parts.append(f"Из задачи \"{dep_id}\" ({dep_id}), файл {a.get('path')}:\n{a['content'][:3000]}")
-        if not dt.artifacts and dt.history:
-            last_result = next((h.get("event") for h in reversed(dt.history) if h.get("event") == "reply"), None)
-            if last_result:
-                parts.append(f"Задача \"{dep_id}\" отмечена done, но артефактов с содержимым нет — см. её result в history.")
+        # research/analysis-задачи ничего не пишут на диск — их результат ТОЛЬКО текст result.
+        # Раньше при пустых artifacts сюда падала бесполезная заглушка "см. history", а сам result
+        # нигде не сохранялся вообще — реализатор честно не мог узнать выводы research.
+        # Только ОДИН, самый длинный (обычно самый содержательный) ответ, коротко обрезанный — три
+        # полных эссе исследователей (по 3000 символов каждое) раздували промпт implementer'а так, что
+        # маленькие бесплатные модели с небольшим общим окном контекста молча резали СВОЙ вывод, независимо
+        # от выставленного max_tokens. Экономия контекста тут важнее полноты.
+        if dt.results:
+            best = max(dt.results, key=len)
+            parts.append(f"Из задачи \"{dep_id}\" ({dep_id}), выводы:\n{best[:1800]}")
+        if not dt.artifacts and not dt.results:
+            parts.append(f"Задача \"{dep_id}\" отмечена done, но не оставила ни файлов, ни текста результата.")
     return "\n\n".join(parts)
+
+
+
+# artifacts[].content везёт полный текст файла ВНУТРИ экранированной JSON-строки (кавычки,
+# переводы строк как \n) — 4096 дефолтных токенов хватает на рассуждение и findings, но не на
+# файл в несколько КБ поверх них. Три живых прогона подряд обрывали implement/checker на этом
+# ровно там, где менеджер сам верно диагностировал «обрыв по лимиту», а лимит никто не поднимал.
+ROLE_MAX_TOKENS = {"implementer": 8192, "checker": 8192, "specialist": 8192}
 
 
 def run_wave(gateway, requests_: list[SpawnRequest], task: Task, board: Board, models_of,
@@ -111,7 +127,8 @@ def run_wave(gateway, requests_: list[SpawnRequest], task: Task, board: Board, m
         # у каждого вызова свой фолбэк (раздел 11) — недоступность одной модели не съедает волну
         futures = {
             pool.submit(call_agent_any, gateway, [model, FALLBACK_MODEL] if model != FALLBACK_MODEL else [model],
-                        role, task.id, task.brief(), extra): (role, model)
+                        role, task.id, task.brief(), extra,
+                        ROLE_MAX_TOKENS.get(role, 4096)): (role, model)
             for role, model in calls
         }
         for fut in as_completed(futures):
@@ -162,6 +179,8 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
     for r in replies:
         task.artifacts += r.artifacts
         task.findings += r.findings
+        if r.status == "done" and r.result:
+            task.results.append(r.result)
         task.log("reply", role=r.role_asked, model=r.model, status=r.status, confidence=r.confidence)
     for r in replies:
         write_artifacts(r.artifacts)
@@ -307,6 +326,22 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
             board.save()
 
         if board.all_done():
+            # Раньше приёмка (реальный verify_cmd) шла ПОСЛЕ выхода из цикла — провал ground truth
+            # заканчивал прогон отчётом "не принято" без единого шанса переоткрыть проваленную задачу,
+            # хотя ревью каждую задачу формально одобрило. По протоколу цикл должен крутиться до
+            # успеха/доказанного тупика/застоя, а не сдаваться на первом расхождении ревью с реальностью.
+            ground_truth_ok, gt_notes, gt_failures = acceptor_check_ground_truth(board)
+            if not ground_truth_ok:
+                for tid, detail in gt_failures.items():
+                    t = board.tasks.get(tid)
+                    if not t:
+                        continue
+                    t.status = "queued"
+                    t.findings = []
+                    t.feedback.append(f"verify_cmd провалился на реальном прогоне: {detail}")
+                    log.info("приёмка: verify_cmd провалил %s, переоткрываю с реальной ошибкой", tid)
+                board.save()
+                continue
             break
 
     acceptance_notes = []
@@ -314,7 +349,7 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
     ground_truth_ok, gt_notes = True, []
     if board.all_done():
         goal_met, why = acceptor_check_goal(gateway, cfg["goal"], board)
-        ground_truth_ok, gt_notes = acceptor_check_ground_truth(board)
+        ground_truth_ok, gt_notes, _ = acceptor_check_ground_truth(board)
         acceptance_notes.append(f"цель: {'ok' if goal_met else 'НЕ ok'} — {why}")
         acceptance_notes += gt_notes
 

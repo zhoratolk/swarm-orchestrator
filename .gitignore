@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 venv/
 run/
+run_*/
+out/
 board.json
 run.log
+run_*.log
 report.md

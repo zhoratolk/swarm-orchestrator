@@ -121,16 +121,25 @@ class SpawnAuditor:
         if not borderline:
             return AuditVerdict(count, "правила: одобрено без эскалации")
 
-        # пограничный случай — спросить дешёвую модель, реально ли это надо, а не просто разрешить
+        # пограничный случай — спросить дешёвую модель, реально ли это надо, а не просто разрешить.
+        # Раньше сюда не попадал task.feedback — ревизор не видел, что предыдущая попытка была
+        # отклонена ревью, и дважды отказывал в повторном implementer после честного reject, приняв
+        # его за произвольное раздувание роя. Причина повтора должна быть видна, не только счётчик.
+        feedback_note = ""
+        if task.feedback:
+            feedback_note = "\n\nПрошлые попытки по этой задаче не приняты:\n" + "\n".join(
+                f"- {f}" for f in task.feedback[-2:]
+            )
         brief = (
             f"Диспетчер просит заспавнить {count} агентов роли \"{req.role}\" для задачи "
             f"\"{task.id}\" ({task.goal}). Причина: {req.reason}. Уже было спавнов этой роли на "
-            f"эту задачу: {already}.\n"
-            "Это реально нужно, или диспетчер плодит агентов без повода? В result верни JSON: "
-            '{"approve_count": N, "why": "..."} — N не больше запрошенного, 0 если не обосновано.'
+            f"эту задачу: {already}.{feedback_note}\n"
+            "Это реально нужно, или диспетчер плодит агентов без повода? Если задача уже была "
+            "отклонена (см. прошлые попытки выше) — новый спавн для исправления оправдан. В result "
+            'верни JSON: {"approve_count": N, "why": "..."} — N не больше запрошенного, 0 если не обосновано.'
         )
         reply = call_agent_any(self.gateway, _with_fallback(AUDITOR_LLM_MODEL), "checker", f"audit-{task.id}-{req.role}",
-                            brief, max_tokens=512)
+                            brief, max_tokens=2048)
         if reply.status != "done":
             return AuditVerdict(0, f"ревизор не смог решить: {reply.result or reply.raw.get('blocked_reason')}")
         try:
@@ -143,7 +152,7 @@ class SpawnAuditor:
 
 # ---------- Диспетчер ----------
 
-def dispatcher_plan(gateway, task: Task, board: Board, max_tokens: int = 1024) -> list[SpawnRequest]:
+def dispatcher_plan(gateway, task: Task, board: Board, max_tokens: int = 2048) -> list[SpawnRequest]:
     """Решает состав для готовой задачи. Rule-based по kind + подтверждение размера волны у LLM
     только когда неочевидно (kind=generic). Вызывается один раз на задачу, до смены её статуса —
     что уже отработано (findings очищены), второй раз план не просят."""
@@ -185,7 +194,7 @@ def dispatcher_reviewers_needed(task: Task, wave_replies: list[AgentReply]) -> l
 
 def review_quorum_verdict(gateway, task: Task, artifact_summary: str,
                            reviewer_models: list[str],
-                           max_tokens: int = 1024) -> tuple[str, list[AgentReply], list[str]]:
+                           max_tokens: int = 4096) -> tuple[str, list[AgentReply], list[str]]:
     """Раздел 6 протокола: approve / approve_with_findings / reject. Любой reject — блокирует,
     расхождение не усредняется (голосов < 3 моделей просто не бывает большинства — решает наличие reject)."""
     # verdict/why описаны как поля верхнего уровня в contract.py::build_prompt (role="reviewer") —
@@ -280,9 +289,12 @@ def acceptor_check_goal(gateway, original_goal: str, board: Board, max_tokens: i
     return v, reply.result or ""
 
 
-def acceptor_check_ground_truth(board: Board) -> tuple[bool, list[str]]:
-    """Не доверяет self_check агентов — реально выполняет verify_cmd каждой задачи на этой машине."""
+def acceptor_check_ground_truth(board: Board) -> tuple[bool, list[str], dict[str, str]]:
+    """Не доверяет self_check агентов — реально выполняет verify_cmd каждой задачи на этой машине.
+    Третий элемент — {task_id: причина отказа} для тех, кто провалил verify_cmd, чтобы вызывающий
+    мог переоткрыть именно их с конкретной ошибкой, а не считать провал приёмки концом прогона."""
     notes = []
+    failures: dict[str, str] = {}
     ok = True
     for t in board.tasks.values():
         if not t.verify_cmd:
@@ -294,8 +306,10 @@ def acceptor_check_ground_truth(board: Board) -> tuple[bool, list[str]]:
             passed = False
             r = None
         note = f"{t.id}: verify_cmd {'ok' if passed else 'FAIL'} — {t.verify_cmd}"
-        if not passed and r is not None:
-            note += f" (код {r.returncode}, stderr: {r.stderr[:200]})"
+        if not passed:
+            fail_detail = f"код {r.returncode}, stderr: {r.stderr[:300]}" if r is not None else "таймаут"
+            note += f" ({fail_detail})"
+            failures[t.id] = fail_detail
         notes.append(note)
         ok = ok and passed
-    return ok, notes
+    return ok, notes, failures

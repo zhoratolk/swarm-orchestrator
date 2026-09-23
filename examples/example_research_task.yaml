@@ -1,0 +1,36 @@
+# Более сложный пример: показывает рой целиком — исследование (адаптивный спавн
+# researcher+analyst), передачу их находок реализатору через контекст зависимостей,
+# ревью-кворум и тесты. Демонстрирует то, что example_task.yaml не может: research-задачу.
+
+goal: >
+  Написать функцию password_strength(pw) на Python, которая оценивает силу пароля
+  по общепринятым правилам (длина, разнообразие символов, распространённые пароли/паттерны)
+  и возвращает один из уровней: "weak", "medium", "strong". Положить в ./out/password.py
+  и юнит-тесты в ./out/test_password.py.
+
+allow_paid: false
+cost_cap: 1.50
+max_iterations: 8
+
+tasks:
+  - id: research
+    goal: >
+      Изучить общепринятые критерии силы пароля (длина, классы символов, топ распространённых
+      паролей, типичные ошибки вроде "Password1!"). Дать конкретные пороги и правила, которые
+      реализатор сможет закодировать без внешних библиотек и без сетевых запросов.
+    kind: research
+    deps: []
+
+  - id: implement
+    goal: >
+      Реализовать password_strength(pw) в out/password.py по правилам из задачи research.
+      Без внешних зависимостей. Вернуть "weak" / "medium" / "strong".
+    kind: implement
+    deps: [research]
+    verify_cmd: "python -c \"import sys; sys.path.insert(0,'out'); from password import password_strength; assert password_strength('123') == 'weak'; assert password_strength('Tr7$kLpQ9!mvXz2#') == 'strong'; assert password_strength('a') != 'strong'\""
+
+  - id: tests
+    goal: "Написать pytest-тесты для password_strength в out/test_password.py: короткие, средние, сильные пароли, распространённые пароли."
+    kind: implement
+    deps: [implement]
+    verify_cmd: "cd out && python -m pytest test_password.py -q"

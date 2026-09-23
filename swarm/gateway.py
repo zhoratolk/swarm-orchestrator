@@ -66,6 +66,7 @@ class CallResult:
     output_tokens: int
     cost: float
     is_byok: bool = False
+    stop_reason: str = ""
 
     def shadow_cost(self, model: str) -> float:
         lo, hi = SHADOW_PRICES.get(model, (1.0, 3.0))
@@ -202,6 +203,7 @@ class Gateway:
                 output_tokens=usage.get("output_tokens", 0),
                 cost=usage.get("cost", 0.0),
                 is_byok=usage.get("is_byok", False),
+                stop_reason=data.get("stop_reason") or "",
             )
             self.usage.add(model, result)
             return result

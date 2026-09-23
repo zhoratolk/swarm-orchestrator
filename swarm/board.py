@@ -22,6 +22,7 @@ class Task:
     findings: list[dict] = field(default_factory=list)
     spawn_count: dict = field(default_factory=dict)  # role -> сколько раз спавнили, для Ревизора
     feedback: list[str] = field(default_factory=list)  # причины прошлых reject/blocked — копится, не теряется при переоткрытии
+    results: list[str] = field(default_factory=list)  # текст result у done-ответов — то, что реально произвела задача, когда она не про файлы (research/analysis)
 
     def log(self, event: str, **kw):
         self.history.append({"t": time.time(), "event": event, **kw})

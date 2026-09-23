@@ -5,7 +5,7 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from .gateway import ModelUnavailable
+from .gateway import GatewayError, ModelUnavailable
 from .scrub import scrub
 
 REQUIRED_KEYS = {
@@ -13,6 +13,7 @@ REQUIRED_KEYS = {
     "artifacts", "tools_used", "findings", "assumptions", "self_check",
 }
 VALID_STATUS = {"done", "blocked", "needs_info"}
+MAX_TOKENS_CEILING = 32768
 VALID_ROLES = {
     "manager", "dispatcher", "researcher", "analyst", "implementer",
     "checker", "reviewer", "specialist", "acceptor",
@@ -133,7 +134,15 @@ def _validate(data: dict) -> list[str]:
 
 
 def build_prompt(role: str, task_id: str, brief: str, extra_context: str = "") -> str:
-    scrubbed, found = scrub(brief + "\n" + extra_context)
+    # reviewer/checker/acceptor получают в brief не авторский текст задачи, а уже СГЕНЕРИРОВАННЫЙ
+    # роем код на проверку — там нет пользовательских секретов (те чистятся при первом же вызове,
+    # где brief ещё был текстом из YAML). Скраб на этом коде ловил цифровые строки вида "123456789"
+    # (список распространённых паролей) и слово "password" как реальные секреты и портил код
+    # <SECRET:PHONE>-заглушками — живой прогон получал заведомо ложный reject на ровном месте.
+    if role in ("reviewer", "checker", "acceptor"):
+        scrubbed, found = brief + "\n" + extra_context, []
+    else:
+        scrubbed, found = scrub(brief + "\n" + extra_context)
     secret_note = f"\n(из текста задачи вычищено: {', '.join(sorted(set(found)))} — не восстанавливать)" if found else ""
     schema = (
         '{"role": "...", "task_id": "...", "spawned_by": "...", "status": "done|blocked|needs_info", '
@@ -147,6 +156,18 @@ def build_prompt(role: str, task_id: str, brief: str, extra_context: str = "") -
         reviewer_note = (
             ' Добавь в этот же JSON-объект (не внутрь result, отдельным ключом верхнего уровня) поле '
             '"goal_met": true|false. result — текстовое обоснование, обычным текстом, не JSON.'
+        )
+    compact_note = ""
+    if role in ("implementer", "checker", "specialist"):
+        # Живые прогоны: несколько подряд попыток обрывали artifacts[].content на середине файла
+        # (~4000 байт) независимо от выставленного max_tokens — похоже на фактический потолок вывода
+        # у части моделей на этом шлюзе, ниже заявленного окна контекста. Раз output реально ограничен,
+        # снижаем не лимит, а требуемый объём: без докстрингов, без длинных комментариев, короткие имена.
+        compact_note = (
+            ' ВАЖНО про объём: пиши МАКСИМАЛЬНО компактный код — без докстрингов, без длинных комментариев, '
+            'без пустых строк между функциями. Если файл всё равно рискует не поместиться целиком — сократи '
+            'логику до минимально достаточной, а не обрывай на середине. Оборванный файл хуже отсутствия '
+            'фичи: используй status="blocked" вместо сдачи неполного файла.'
         )
     if role == "reviewer":
         # НЕ просить вложенный JSON внутри строки result — живые модели на этом сыпятся (вложенный
@@ -165,7 +186,7 @@ def build_prompt(role: str, task_id: str, brief: str, extra_context: str = "") -
         f"опиши в result что именно нужно. Если задача невыполнима — status=\"blocked\" и заполни blocked_reason. "
         f"Если создаёшь или меняешь файл — artifacts[].content ОБЯЗАН содержать полный текст файла, "
         f"а не только путь: путь без содержимого при status=\"done\" не считается выполненной работой. "
-        f"findings — список ОБЪЕКТОВ по схеме выше, не голых строк.{reviewer_note}"
+        f"findings — список ОБЪЕКТОВ по схеме выше, не голых строк.{compact_note}{reviewer_note}"
     )
 
 
@@ -180,6 +201,13 @@ def call_agent(gateway, model: str, role: str, task_id: str, brief: str, extra_c
             f"Пришли заново — только исправленный JSON, без текста вокруг."
         )
         result = gateway.call(model, full_prompt, max_tokens=max_tokens)
+        if getattr(result, "stop_reason", "") == "max_tokens":
+            # Reasoning-модели (GPT-6, Opus с thinking) тратят max_tokens на скрытое рассуждение:
+            # при малом бюджете видимый текст пустой или оборван посреди файла. Повтор с тем же
+            # лимитом дал бы тот же обрыв — удваиваем бюджет вместо слепого ретрая.
+            last_error = f"ответ обрезан по max_tokens={max_tokens}"
+            max_tokens = min(max_tokens * 2, MAX_TOKENS_CEILING)
+            continue
         try:
             data = _extract_json(result.text)
         except (json.JSONDecodeError, ValueError) as e:
@@ -210,13 +238,15 @@ def call_agent_any(gateway, models: list[str], role: str, task_id: str, brief: s
                     max_tokens: int = 4096, max_repairs: int = 2) -> AgentReply:
     """Пробует модели по очереди (раздел 11: устойчивость), пропускает недоступные (ModelUnavailable —
     геоблок 403, промо-статус слетел 429 model_requires_purchase, устойчивый 429 на этой попытке).
+    Ловим и обычный GatewayError (400 «provider refused», исчерпанные ретраи 429/5xx) тем же путём —
+    это тоже отказ конкретной модели/запроса, а не повод ронять весь прогон целиком.
     Первая, что ответила, — результат. Если недоступны все — синтетический blocked, не падает."""
     tried: list[str] = []
     last_model = models[-1] if models else "?"
     for model in models:
         try:
             return call_agent(gateway, model, role, task_id, brief, extra_context, max_tokens, max_repairs)
-        except ModelUnavailable as e:
+        except GatewayError as e:
             tried.append(str(e))
             last_model = model
             continue
