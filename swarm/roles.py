@@ -282,7 +282,9 @@ def acceptor_check_goal(gateway, original_goal: str, board: Board, max_tokens: i
         parts.append(f"- Задача \"{t.id}\" [{t.status}]: {t.goal}")
         for a in t.artifacts:
             if a.get("content"):
-                parts.append(f"  Файл {a.get('path')}:\n{a['content'][:3000]}")
+                # тот же кап, что у ревьюеров (orchestrator.py) — раньше 3000 символов резало крупные
+                # файлы посреди функции, приёмщик честно не мог сверить обрезанный код с целью
+                parts.append(f"  Файл {a.get('path')}:\n{a['content'][:60000]}")
     summary = "\n".join(parts)
     brief = (
         f"{summary}\n\n"

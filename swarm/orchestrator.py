@@ -122,7 +122,9 @@ def dep_context(board: Board, task: Task) -> str:
             continue
         for a in dt.artifacts:
             if a.get("content"):
-                parts.append(f"Из задачи \"{dep_id}\" ({dep_id}), файл {a.get('path')}:\n{a['content'][:3000]}")
+                # тот же кап, что у ревьюеров/приёмщика — файл зависимости должен быть виден целиком,
+                # иначе следующая по цепочке задача (например tests) не увидит реальные сигнатуры
+                parts.append(f"Из задачи \"{dep_id}\" ({dep_id}), файл {a.get('path')}:\n{a['content'][:60000]}")
         # research/analysis-задачи ничего не пишут на диск — их результат ТОЛЬКО текст result.
         # Раньше при пустых artifacts сюда падала бесполезная заглушка "см. history", а сам result
         # нигде не сохранялся вообще — реализатор честно не мог узнать выводы research.
@@ -248,12 +250,17 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
         task.log("audit", role="reviewer", requested=review_req.count,
                   approved=verdict.approved_count, note=verdict.note)
         if verdict.approved_count >= 1:
-            # ревьюерам — реальное содержимое файлов, не только пересказ, иначе им физически нечего оценивать
+            # ревьюерам — реальное содержимое файлов, не только пересказ, иначе им физически нечего оценивать.
+            # Кап был 4000 символов — на демо-файлах в пару КБ незаметно, но живой прогон на 18КБ-файле
+            # (vtube-acmt/volume_layers.py) резал ровно посреди функции: ревью честно писало "artifact
+            # обрывается" и отклоняло рабочий код за то, что сам оркестратор его обрезал перед показом.
+            # Модели здесь — с окном контекста от 512K до 1M (проверено), входной размер не был узким
+            # местом нигде в живых прогонах; 60000 — щедрый, но не безлимитный запас.
             parts = [r.result for r in replies if r.result]
             for r in replies:
                 for a in r.artifacts:
                     if a.get("content"):
-                        parts.append(f"--- {a.get('path')} ---\n{a['content'][:4000]}")
+                        parts.append(f"--- {a.get('path')} ---\n{a['content'][:60000]}")
             summary = "\n\n".join(parts)
             final_verdict, review_replies, reasons = review_quorum_verdict(
                 gateway, task, summary, reviewer_models[:verdict.approved_count])
