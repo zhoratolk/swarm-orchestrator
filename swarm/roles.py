@@ -42,15 +42,20 @@ def _with_fallback(*models: str) -> list[str]:
 
 # ---------- Менеджер ----------
 
-def manager_decompose(gateway, goal: str, max_tokens: int = 4096) -> list[Task]:
-    """Раскладывает цель на задачи один раз в начале, если задачи не заданы в YAML руками."""
+def manager_decompose(gateway, goal: str, repo_context: str = "", max_tokens: int = 4096) -> list[Task]:
+    """Раскладывает цель на задачи один раз в начале, если задачи не заданы в YAML руками.
+
+    repo_context — исходники целевого репозитория (cfg["repo_context"] в YAML), если заданы. Без
+    этого Менеджер планирует задачи вслепую, не видя реального кода — годится для задач "написать
+    с нуля", но бессмысленно для "найти и исправить баг в существующем коде"."""
     brief = (
         f"Разложи цель на независимые (по возможности) задачи для роя. Цель:\n{goal}\n\n"
         "В result верни JSON-массив задач строкой: "
         '[{"id": "t1", "goal": "...", "deps": [], "kind": "research|implement|generic", "verify_cmd": null}, ...]. '
         "id короткие, deps — id других задач из этого же списка, kind подсказывает какого рода работа."
     )
-    reply = call_agent_any(gateway, _with_fallback(MANAGER_MODEL), "manager", "decompose", brief, max_tokens=max_tokens)
+    reply = call_agent_any(gateway, _with_fallback(MANAGER_MODEL), "manager", "decompose", brief,
+                            repo_context, max_tokens=max_tokens)
     tasks: list[Task] = []
     if reply.status == "done":
         try:
@@ -65,14 +70,16 @@ def manager_decompose(gateway, goal: str, max_tokens: int = 4096) -> list[Task]:
     return tasks
 
 
-def manager_replan(gateway, board: Board, findings_summary: str, max_tokens: int = 2048) -> str:
+def manager_replan(gateway, board: Board, findings_summary: str, repo_context: str = "",
+                    max_tokens: int = 2048) -> str:
     """Вызывается при застое/reject — Менеджер решает, что делать дальше. Возвращает свободный текст-решение."""
     brief = (
         f"Доска задач застряла. Находки: {findings_summary}\n"
         "Реши: какую задачу переоткрыть, что изменить в подходе, или что эскалировать человеку. "
         "Кратко в result."
     )
-    reply = call_agent_any(gateway, _with_fallback(MANAGER_MODEL), "manager", "replan", brief, max_tokens=max_tokens)
+    reply = call_agent_any(gateway, _with_fallback(MANAGER_MODEL), "manager", "replan", brief,
+                            repo_context, max_tokens=max_tokens)
     return reply.result
 
 
@@ -152,7 +159,8 @@ class SpawnAuditor:
 
 # ---------- Диспетчер ----------
 
-def dispatcher_plan(gateway, task: Task, board: Board, max_tokens: int = 2048) -> list[SpawnRequest]:
+def dispatcher_plan(gateway, task: Task, board: Board, repo_context: str = "",
+                     max_tokens: int = 2048) -> list[SpawnRequest]:
     """Решает состав для готовой задачи. Rule-based по kind + подтверждение размера волны у LLM
     только когда неочевидно (kind=generic). Вызывается один раз на задачу, до смены её статуса —
     что уже отработано (findings очищены), второй раз план не просят."""
@@ -168,7 +176,8 @@ def dispatcher_plan(gateway, task: Task, board: Board, max_tokens: int = 2048) -
             "для её выполнения. Роли: researcher, analyst, implementer, specialist. В result верни "
             'JSON-массив: [{"role": "...", "count": N, "reason": "..."}]. Не спавнь больше, чем реально нужно.'
         )
-        reply = call_agent_any(gateway, _with_fallback(DISPATCHER_MODEL), "dispatcher", task.id, brief, max_tokens=max_tokens)
+        reply = call_agent_any(gateway, _with_fallback(DISPATCHER_MODEL), "dispatcher", task.id, brief,
+                                repo_context, max_tokens=max_tokens)
         if reply.status == "done":
             try:
                 raw = json.loads(reply.result) if isinstance(reply.result, str) else reply.result
