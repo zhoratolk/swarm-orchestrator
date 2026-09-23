@@ -155,7 +155,16 @@ class SpawnAuditor:
         reply = call_agent_any(self.gateway, _with_fallback(AUDITOR_LLM_MODEL, AUDITOR_FALLBACK_MODEL),
                             "checker", f"audit-{task.id}-{req.role}", brief, max_tokens=2048)
         if reply.status != "done":
-            return AuditVerdict(0, f"ревизор не смог решить: {reply.result or reply.raw.get('blocked_reason')}")
+            # Живой прогон (shakedown-game, 2026-09-24): обе audit-модели легли (nemotron мёртвая
+            # с прошлого спавна, gpt-5.6-luna тоже недоступна в моменте) -> каждый повторный спавн
+            # после честного reject получал отказ 0 без единого реального суждения, застой
+            # гарантирован за 3 итерации. Инфраструктурный отказ ("модель недоступна") — это не то
+            # же самое, что содержательное решение "не обосновано". Раз модель физически не
+            # ответила, падаем на тот же лимит, что и rule-based путь non-borderline случая (count,
+            # уже урезанный лимитами MAX_PER_TASK_PER_ROLE/MAX_PARALLEL_PER_TASK выше) — не
+            # неограниченно, но и не глухой запрет навсегда.
+            return AuditVerdict(count, f"ревизор недоступен, одобрено по лимитам без LLM-подтверждения: "
+                                        f"{reply.result or reply.raw.get('blocked_reason')}")
         try:
             verdict = json.loads(reply.result) if isinstance(reply.result, str) else reply.result
             n = max(0, min(int(verdict.get("approve_count", 0)), count))

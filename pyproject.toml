@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+# Дефолтный temp юзера (Windows, кириллица в имени) даёт PermissionError на tmp_path -
+# та же грабля, что в shorts-maker. Basetemp — репо-локальная папка, гитигнорена.
+addopts = "--basetemp=.pytest_tmp"

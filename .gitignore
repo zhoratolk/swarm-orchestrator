@@ -10,3 +10,6 @@ board.json
 run.log
 run_*.log
 report.md
+.pytest_tmp/
+.pytest_cache/
+.coverage
