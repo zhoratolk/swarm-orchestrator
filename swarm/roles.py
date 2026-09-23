@@ -62,7 +62,8 @@ def manager_decompose(gateway, goal: str, repo_context: str = "", max_tokens: in
             raw = json.loads(reply.result) if isinstance(reply.result, str) else reply.result
             for t in raw:
                 tasks.append(Task(id=t["id"], goal=t["goal"], deps=t.get("deps", []),
-                                   kind=t.get("kind", "generic"), verify_cmd=t.get("verify_cmd")))
+                                   kind=t.get("kind", "generic"), verify_cmd=t.get("verify_cmd"),
+                                   verify_cmd_source="llm"))
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
     if not tasks:
@@ -300,15 +301,27 @@ def acceptor_check_goal(gateway, original_goal: str, board: Board, max_tokens: i
     return v, reply.result or ""
 
 
-def acceptor_check_ground_truth(board: Board) -> tuple[bool, list[str], dict[str, str]]:
+def acceptor_check_ground_truth(board: Board, allow_llm_verify_cmd: bool = False) -> tuple[bool, list[str], dict[str, str]]:
     """Не доверяет self_check агентов — реально выполняет verify_cmd каждой задачи на этой машине.
     Третий элемент — {task_id: причина отказа} для тех, кто провалил verify_cmd, чтобы вызывающий
-    мог переоткрыть именно их с конкретной ошибкой, а не считать провал приёмки концом прогона."""
+    мог переоткрыть именно их с конкретной ошибкой, а не считать провал приёмки концом прогона.
+
+    verify_cmd_source="llm" (вписан Менеджером при авто-декомпозиции цели, не человеком в YAML) НЕ
+    исполняется, если allow_llm_verify_cmd не выставлен явно — иначе бесплатная модель без ревью
+    получает произвольный shell-доступ к машине через subprocess.run(shell=True) ниже. Пропущенная
+    команда падает не в failures, а трактуется как отсутствующий verify_cmd — приёмка остаётся на
+    ревью-кворуме/self-report, как для любой задачи без verify_cmd вообще."""
     notes = []
     failures: dict[str, str] = {}
     ok = True
     for t in board.tasks.values():
         if not t.verify_cmd:
+            continue
+        if t.verify_cmd_source == "llm" and not allow_llm_verify_cmd:
+            notes.append(
+                f"{t.id}: verify_cmd от LLM пропущен без allow_llm_verify_cmd (не выполняется "
+                f"на машине без ревью человека) — {t.verify_cmd}"
+            )
             continue
         try:
             r = subprocess.run(t.verify_cmd, shell=True, capture_output=True, text=True, timeout=120)

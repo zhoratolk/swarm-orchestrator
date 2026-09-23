@@ -38,6 +38,10 @@ def load_config(path: Path) -> dict:
     cfg.setdefault("goal", "")
     cfg.setdefault("tasks", [])
     cfg.setdefault("allow_paid", False)
+    # LLM-сгенерированный verify_cmd (Менеджер при авто-декомпозиции цели) по умолчанию НЕ
+    # выполняется shell-командой на машине — command injection от бесплатной модели без ревью
+    # человека. False = как раньше вело себя ТОЛЬКО для человеком-заданных задач; включать осознанно.
+    cfg.setdefault("allow_llm_verify_cmd", False)
     cfg.setdefault("cost_cap", None)
     cfg.setdefault("max_iterations", 6)
     cfg.setdefault("repo_context", [])  # список glob-паттернов исходников для Менеджера/Диспетчера/агентов
@@ -378,7 +382,7 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
             # заканчивал прогон отчётом "не принято" без единого шанса переоткрыть проваленную задачу,
             # хотя ревью каждую задачу формально одобрило. По протоколу цикл должен крутиться до
             # успеха/доказанного тупика/застоя, а не сдаваться на первом расхождении ревью с реальностью.
-            ground_truth_ok, gt_notes, gt_failures = acceptor_check_ground_truth(board)
+            ground_truth_ok, gt_notes, gt_failures = acceptor_check_ground_truth(board, cfg["allow_llm_verify_cmd"])
             if not ground_truth_ok:
                 for tid, detail in gt_failures.items():
                     t = board.tasks.get(tid)
@@ -397,7 +401,7 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
     ground_truth_ok, gt_notes = True, []
     if board.all_done():
         goal_met, why = acceptor_check_goal(gateway, cfg["goal"], board)
-        ground_truth_ok, gt_notes, _ = acceptor_check_ground_truth(board)
+        ground_truth_ok, gt_notes, _ = acceptor_check_ground_truth(board, cfg["allow_llm_verify_cmd"])
         acceptance_notes.append(f"цель: {'ok' if goal_met else 'НЕ ok'} — {why}")
         acceptance_notes += gt_notes
 

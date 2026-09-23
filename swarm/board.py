@@ -17,6 +17,10 @@ class Task:
     goal: str
     deps: list[str] = field(default_factory=list)
     verify_cmd: str | None = None
+    # "user" (задан в YAML человеком) или "llm" (вписан Менеджером при авто-декомпозиции цели) —
+    # acceptor_check_ground_truth исполняет shell-командой только "user"; "llm" без явного
+    # allow_llm_verify_cmd в конфиге — command injection от бесплатной модели без ревью.
+    verify_cmd_source: str = "user"
     kind: str = "generic"  # research | implement | generic — подсказка Диспетчеру
     status: str = "queued"
     history: list[dict] = field(default_factory=list)
