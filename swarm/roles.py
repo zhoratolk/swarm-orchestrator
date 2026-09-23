@@ -11,20 +11,33 @@ import subprocess
 from dataclasses import dataclass, field
 
 from .board import Board, Task
-from .contract import call_agent, AgentReply
+from .contract import call_agent, call_agent_any, AgentReply
 
 MANAGER_MODEL = "claude-opus-5.5"
 DISPATCHER_MODEL = "gpt-6-luna"
 AUDITOR_LLM_MODEL = "nemotron-3-ultra-550b-a55b"
 ACCEPTOR_MODELS = ("claude-opus-5.5", "gpt-6-sol")
 
+# Раздел 11: единственная модель без геоблоков на некоторых сетях (проверено эмпирически —
+# Anthropic/OpenAI-семейства отдают 403 permission_error с рядом IP, NVIDIA-инфра нет). Если
+# основная модель роли недоступна в этом прогоне, следующий вызов той же роли уходит сюда —
+# рой не падает целиком из-за одного заблокированного провайдера.
+FALLBACK_MODEL = "nemotron-3-ultra-550b-a55b"
+
 ROLE_MODEL_DEFAULTS = {
-    "researcher": ["gpt-6-sol", "gpt-6-luna"],
-    "analyst": ["gpt-5.6-luna"],
-    "implementer": ["gpt-6-sol", "claude-opus-5.5"],
-    "checker": ["gpt-6-luna"],
-    "specialist": ["gpt-6-sol"],
+    "researcher": ["gpt-6-sol", "gpt-6-luna", FALLBACK_MODEL],
+    "analyst": ["gpt-5.6-luna", FALLBACK_MODEL],
+    "implementer": ["gpt-6-sol", "claude-opus-5.5", FALLBACK_MODEL],
+    "checker": ["gpt-6-luna", FALLBACK_MODEL],
+    "specialist": ["gpt-6-sol", FALLBACK_MODEL],
 }
+
+
+def _with_fallback(*models: str) -> list[str]:
+    out = list(dict.fromkeys(models))  # без дублей, порядок сохранён
+    if FALLBACK_MODEL not in out:
+        out.append(FALLBACK_MODEL)
+    return out
 
 
 # ---------- Менеджер ----------
@@ -37,7 +50,7 @@ def manager_decompose(gateway, goal: str, max_tokens: int = 4096) -> list[Task]:
         '[{"id": "t1", "goal": "...", "deps": [], "kind": "research|implement|generic", "verify_cmd": null}, ...]. '
         "id короткие, deps — id других задач из этого же списка, kind подсказывает какого рода работа."
     )
-    reply = call_agent(gateway, MANAGER_MODEL, "manager", "decompose", brief, max_tokens=max_tokens)
+    reply = call_agent_any(gateway, _with_fallback(MANAGER_MODEL), "manager", "decompose", brief, max_tokens=max_tokens)
     tasks: list[Task] = []
     if reply.status == "done":
         try:
@@ -59,7 +72,7 @@ def manager_replan(gateway, board: Board, findings_summary: str, max_tokens: int
         "Реши: какую задачу переоткрыть, что изменить в подходе, или что эскалировать человеку. "
         "Кратко в result."
     )
-    reply = call_agent(gateway, MANAGER_MODEL, "manager", "replan", brief, max_tokens=max_tokens)
+    reply = call_agent_any(gateway, _with_fallback(MANAGER_MODEL), "manager", "replan", brief, max_tokens=max_tokens)
     return reply.result
 
 
@@ -116,7 +129,7 @@ class SpawnAuditor:
             "Это реально нужно, или диспетчер плодит агентов без повода? В result верни JSON: "
             '{"approve_count": N, "why": "..."} — N не больше запрошенного, 0 если не обосновано.'
         )
-        reply = call_agent(self.gateway, AUDITOR_LLM_MODEL, "checker", f"audit-{task.id}-{req.role}",
+        reply = call_agent_any(self.gateway, _with_fallback(AUDITOR_LLM_MODEL), "checker", f"audit-{task.id}-{req.role}",
                             brief, max_tokens=512)
         if reply.status != "done":
             return AuditVerdict(0, f"ревизор не смог решить: {reply.result or reply.raw.get('blocked_reason')}")
@@ -146,7 +159,7 @@ def dispatcher_plan(gateway, task: Task, board: Board, max_tokens: int = 1024) -
             "для её выполнения. Роли: researcher, analyst, implementer, specialist. В result верни "
             'JSON-массив: [{"role": "...", "count": N, "reason": "..."}]. Не спавнь больше, чем реально нужно.'
         )
-        reply = call_agent(gateway, DISPATCHER_MODEL, "dispatcher", task.id, brief, max_tokens=max_tokens)
+        reply = call_agent_any(gateway, _with_fallback(DISPATCHER_MODEL), "dispatcher", task.id, brief, max_tokens=max_tokens)
         if reply.status == "done":
             try:
                 raw = json.loads(reply.result) if isinstance(reply.result, str) else reply.result
@@ -155,6 +168,49 @@ def dispatcher_plan(gateway, task: Task, board: Board, max_tokens: int = 1024) -
                 pass
         return [SpawnRequest("specialist", 1, "диспетчер не распознал тип задачи, свободный агент", task.id)]
     return []
+
+
+# Пул для ревью (раздел 6): минимум 3 РАЗНЫЕ модели, ни одна не автор проверяемого артефакта.
+REVIEWER_POOL = ["gpt-6-sol", "gpt-6-luna", "gpt-5.6-luna", "claude-opus-5.5", FALLBACK_MODEL]
+
+
+def dispatcher_reviewers_needed(task: Task, wave_replies: list[AgentReply]) -> list[str]:
+    """Артефакт готов к ревью -> модели ревьюеров, исключая авторов. Пустой список — ревьюить нечего."""
+    if not any(r.artifacts for r in wave_replies):
+        return []
+    authors = {r.model for r in wave_replies}
+    pool = [m for m in REVIEWER_POOL if m not in authors]
+    return pool[:3]
+
+
+def review_quorum_verdict(gateway, task: Task, artifact_summary: str,
+                           reviewer_models: list[str], max_tokens: int = 1024) -> tuple[str, list[AgentReply]]:
+    """Раздел 6 протокола: approve / approve_with_findings / reject. Любой reject — блокирует,
+    расхождение не усредняется (голосов < 3 моделей просто не бывает большинства — решает наличие reject)."""
+    brief = (
+        f"Ревью артефакта задачи \"{task.id}\" ({task.goal}). Что сдали:\n{artifact_summary}\n\n"
+        "Оцени: закрывает ли это задачу, нет ли явных ошибок. В result JSON: "
+        '{"verdict": "approve|approve_with_findings|reject", "why": "..."}.'
+    )
+    replies = [
+        call_agent_any(gateway, [m, FALLBACK_MODEL] if m != FALLBACK_MODEL else [m],
+                        "reviewer", f"review-{task.id}", brief, max_tokens=max_tokens)
+        for m in reviewer_models
+    ]
+    verdicts = []
+    for r in replies:
+        try:
+            v = json.loads(r.result) if isinstance(r.result, str) else r.result
+            verdicts.append(v.get("verdict", "reject"))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            verdicts.append("reject")  # нечитаемый ответ ревьюера — не молчаливое одобрение
+    if "reject" in verdicts:
+        final = "reject"
+    elif "approve_with_findings" in verdicts:
+        final = "approve_with_findings"
+    else:
+        final = "approve"
+    return final, replies
 
 
 def dispatcher_checker_needed(task: Task, wave_replies: list[AgentReply]) -> SpawnRequest | None:
@@ -195,7 +251,7 @@ def acceptor_check_goal(gateway, original_goal: str, board: Board, max_tokens: i
         "Сверь результат с исходной ЦЕЛЬЮ, не со списком задач — задачи могли быть выполнены "
         "формально и мимо цели. В result JSON: {\"goal_met\": bool, \"why\": \"...\"}."
     )
-    reply = call_agent(gateway, ACCEPTOR_MODELS[0], "acceptor", "accept-goal", brief, max_tokens=max_tokens)
+    reply = call_agent_any(gateway, _with_fallback(*ACCEPTOR_MODELS), "acceptor", "accept-goal", brief, max_tokens=max_tokens)
     if reply.status != "done":
         return False, reply.raw.get("blocked_reason", "приёмщик не смог оценить")
     try:

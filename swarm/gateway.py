@@ -164,6 +164,17 @@ class Gateway:
                 delay *= 2
                 continue
 
+            if r.status_code == 403:
+                try:
+                    err = r.json().get("error", {})
+                except ValueError:
+                    err = {}
+                msg = err.get("message", r.text[:200])
+                # постоянный отказ (обычно геоблок апстрима у Anthropic/OpenAI-семейств), не транзиент —
+                # ретраить бессмысленно, сразу помечаем мёртвой на этот прогон и уходим на фолбэк выше по стеку
+                self.dead_models.add(model)
+                raise ModelUnavailable(f"{model}: 403 {msg}")
+
             if r.status_code >= 500:
                 last_err = GatewayError(f"{r.status_code} от {model} (попытка {attempt + 1})")
                 time.sleep(delay + random.uniform(0, 0.3))

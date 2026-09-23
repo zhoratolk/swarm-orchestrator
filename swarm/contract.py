@@ -68,6 +68,50 @@ def _extract_json(text: str) -> dict:
     return json.loads(text)
 
 
+def _normalize(data: dict) -> dict:
+    """Живые модели не всегда держат схему буквально (findings строками вместо объектов и т.п.) —
+    подправить форму, не проваливать честный ответ из-за мелочи, которую легко подстелить."""
+    findings = data.get("findings")
+    if isinstance(findings, list):
+        fixed = []
+        for f in findings:
+            if isinstance(f, dict):
+                fixed.append(f)
+            else:
+                fixed.append({"severity": "minor", "what": str(f), "where": "", "fix": ""})
+        data["findings"] = fixed
+    elif findings is not None and not isinstance(findings, list):
+        data["findings"] = [{"severity": "minor", "what": str(findings), "where": "", "fix": ""}]
+
+    assumptions = data.get("assumptions")
+    if isinstance(assumptions, list):
+        data["assumptions"] = [a if isinstance(a, str) else str(a) for a in assumptions]
+    elif assumptions is not None and not isinstance(assumptions, list):
+        data["assumptions"] = [str(assumptions)]
+
+    artifacts = data.get("artifacts")
+    if isinstance(artifacts, list):
+        fixed_artifacts = []
+        for a in artifacts:
+            if isinstance(a, dict):
+                a.setdefault("content", "")
+                fixed_artifacts.append(a)
+            else:
+                fixed_artifacts.append({"path": str(a), "action": "create", "content": ""})
+        data["artifacts"] = fixed_artifacts
+    else:
+        data["artifacts"] = []
+
+    tools_used = data.get("tools_used")
+    if not isinstance(tools_used, list):
+        data["tools_used"] = []
+
+    if not isinstance(data.get("self_check"), dict):
+        data["self_check"] = {"goal_met": False, "why": str(data.get("self_check", ""))}
+
+    return data
+
+
 def _validate(data: dict) -> list[str]:
     problems = []
     missing = REQUIRED_KEYS - data.keys()
@@ -93,7 +137,9 @@ def build_prompt(role: str, task_id: str, brief: str, extra_context: str = "") -
     secret_note = f"\n(из текста задачи вычищено: {', '.join(sorted(set(found)))} — не восстанавливать)" if found else ""
     schema = (
         '{"role": "...", "task_id": "...", "spawned_by": "...", "status": "done|blocked|needs_info", '
-        '"confidence": 0.0, "result": "...", "artifacts": [...], "tools_used": [...], "findings": [...], '
+        '"confidence": 0.0, "result": "...", '
+        '"artifacts": [{"path": "...", "action": "create", "content": "ПОЛНЫЙ текст файла целиком"}], '
+        '"tools_used": [...], "findings": [{"severity": "blocker|major|minor", "what": "...", "where": "...", "fix": "..."}], '
         '"assumptions": [...], "blocked_reason": "...", "self_check": {"goal_met": false, "why": "..."}}'
     )
     return (
@@ -101,7 +147,10 @@ def build_prompt(role: str, task_id: str, brief: str, extra_context: str = "") -
         f"Задача:\n{scrubbed}{secret_note}\n\n"
         f"Верни ТОЛЬКО валидный JSON, без пояснений вокруг, строго по схеме:\n{schema}\n"
         f"role в ответе обязан быть \"{role}\". Если чего-то не хватает для выполнения — status=\"needs_info\", "
-        f"опиши в result что именно нужно. Если задача невыполнима — status=\"blocked\" и заполни blocked_reason."
+        f"опиши в result что именно нужно. Если задача невыполнима — status=\"blocked\" и заполни blocked_reason. "
+        f"Если создаёшь или меняешь файл — artifacts[].content ОБЯЗАН содержать полный текст файла, "
+        f"а не только путь: путь без содержимого при status=\"done\" не считается выполненной работой. "
+        f"findings — список ОБЪЕКТОВ по схеме выше, не голых строк."
     )
 
 
@@ -121,6 +170,7 @@ def call_agent(gateway, model: str, role: str, task_id: str, brief: str, extra_c
         except (json.JSONDecodeError, ValueError) as e:
             last_error = f"не удалось распарсить JSON: {e}"
             continue
+        data = _normalize(data)
         problems = _validate(data)
         if problems:
             last_error = "; ".join(problems)
@@ -138,4 +188,30 @@ def call_agent(gateway, model: str, role: str, task_id: str, brief: str, extra_c
             "self_check": {"goal_met": False, "why": "contract violation"},
         },
         model=model, role_asked=role,
+    )
+
+
+def call_agent_any(gateway, models: list[str], role: str, task_id: str, brief: str, extra_context: str = "",
+                    max_tokens: int = 4096, max_repairs: int = 2) -> AgentReply:
+    """Пробует модели по очереди (раздел 11: устойчивость), пропускает недоступные (ModelUnavailable —
+    геоблок 403, промо-статус слетел 429 model_requires_purchase, устойчивый 429 на этой попытке).
+    Первая, что ответила, — результат. Если недоступны все — синтетический blocked, не падает."""
+    tried: list[str] = []
+    last_model = models[-1] if models else "?"
+    for model in models:
+        try:
+            return call_agent(gateway, model, role, task_id, brief, extra_context, max_tokens, max_repairs)
+        except ModelUnavailable as e:
+            tried.append(str(e))
+            last_model = model
+            continue
+    return AgentReply(
+        raw={
+            "role": role, "task_id": task_id, "spawned_by": "all-models-unavailable",
+            "status": "blocked", "confidence": 0.0,
+            "result": "", "artifacts": [], "tools_used": [], "findings": [],
+            "assumptions": [], "blocked_reason": f"все модели в списке недоступны: {'; '.join(tried)}",
+            "self_check": {"goal_met": False, "why": "no reachable model"},
+        },
+        model=last_model, role_asked=role,
     )

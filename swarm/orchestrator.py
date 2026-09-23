@@ -11,12 +11,13 @@ import yaml
 from dotenv import load_dotenv
 
 from .board import Board, Task
-from .contract import call_agent, AgentReply
+from .contract import call_agent_any, AgentReply
 from .gateway import Gateway, FakeGateway, Usage, GatewayError, ModelUnavailable
 from .roles import (
     manager_decompose, manager_replan, dispatcher_plan, dispatcher_checker_needed,
+    dispatcher_reviewers_needed, review_quorum_verdict,
     SpawnAuditor, SpawnRequest, acceptor_check_goal, acceptor_check_ground_truth,
-    ROLE_MODEL_DEFAULTS,
+    ROLE_MODEL_DEFAULTS, FALLBACK_MODEL,
 )
 
 log = logging.getLogger("swarm")
@@ -55,16 +56,16 @@ def run_wave(gateway, requests_: list[SpawnRequest], task: Task, models_of, work
 
     replies: list[AgentReply] = []
     with ThreadPoolExecutor(max_workers=min(workers, len(calls))) as pool:
+        # у каждого вызова свой фолбэк (раздел 11) — недоступность одной модели не съедает волну
         futures = {
-            pool.submit(call_agent, gateway, model, role, task.id, task.goal): (role, model)
+            pool.submit(call_agent_any, gateway, [model, FALLBACK_MODEL] if model != FALLBACK_MODEL else [model],
+                        role, task.id, task.goal): (role, model)
             for role, model in calls
         }
         for fut in as_completed(futures):
             role, model = futures[fut]
             try:
                 replies.append(fut.result())
-            except ModelUnavailable as e:
-                log.warning("модель %s недоступна для роли %s: %s — пропуск", model, role, e)
             except GatewayError as e:
                 log.error("сбой вызова %s/%s: %s", role, model, e)
     return replies
@@ -127,7 +128,39 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
     blockers = [f for f in task.findings if f.get("severity") == "blocker"]
     if blockers:
         task.status = "blocked"
-    elif any(r.status == "done" for r in replies):
+        return
+
+    reviewer_models = dispatcher_reviewers_needed(task, replies)
+    if reviewer_models:
+        review_req = SpawnRequest("reviewer", len(reviewer_models), "кворум ревью готового артефакта", task.id)
+        verdict = auditor.review(review_req, task)
+        task.log("audit", role="reviewer", requested=review_req.count,
+                  approved=verdict.approved_count, note=verdict.note)
+        if verdict.approved_count >= 1:
+            # ревьюерам — реальное содержимое файлов, не только пересказ, иначе им физически нечего оценивать
+            parts = [r.result for r in replies if r.result]
+            for r in replies:
+                for a in r.artifacts:
+                    if a.get("content"):
+                        parts.append(f"--- {a.get('path')} ---\n{a['content'][:4000]}")
+            summary = "\n\n".join(parts)
+            final_verdict, review_replies = review_quorum_verdict(
+                gateway, task, summary, reviewer_models[:verdict.approved_count])
+            # models в логе — кто РЕАЛЬНО ответил (после фолбэка), не то, что запрашивали
+            task.log("review", verdict=final_verdict, models=[r.model for r in review_replies])
+            if final_verdict == "reject":
+                task.status = "blocked"
+                task.findings.append({
+                    "severity": "blocker", "what": "ревью отклонило артефакт (кворум reject)",
+                    "where": task.id,
+                    "fix": "; ".join(r.result for r in review_replies if r.result) or "см. review в history",
+                })
+                return
+            if final_verdict == "approve_with_findings":
+                for r in review_replies:
+                    task.findings += [f for f in r.findings if f.get("severity") != "blocker"]
+
+    if any(r.status == "done" for r in replies):
         task.status = "done"
     else:
         task.status = "needs_review"
