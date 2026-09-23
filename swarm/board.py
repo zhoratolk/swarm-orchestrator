@@ -21,9 +21,17 @@ class Task:
     artifacts: list[dict] = field(default_factory=list)
     findings: list[dict] = field(default_factory=list)
     spawn_count: dict = field(default_factory=dict)  # role -> сколько раз спавнили, для Ревизора
+    feedback: list[str] = field(default_factory=list)  # причины прошлых reject/blocked — копится, не теряется при переоткрытии
 
     def log(self, event: str, **kw):
         self.history.append({"t": time.time(), "event": event, **kw})
+
+    def brief(self) -> str:
+        """Задача для агента: цель плюс то, что не получилось в прошлые заходы, если было."""
+        if not self.feedback:
+            return self.goal
+        past = "\n".join(f"- {f}" for f in self.feedback[-3:])
+        return (f"{self.goal}\n\nПрошлые попытки не приняты, учти это в этой:\n{past}")
 
 
 class Board:

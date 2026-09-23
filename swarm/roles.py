@@ -184,33 +184,46 @@ def dispatcher_reviewers_needed(task: Task, wave_replies: list[AgentReply]) -> l
 
 
 def review_quorum_verdict(gateway, task: Task, artifact_summary: str,
-                           reviewer_models: list[str], max_tokens: int = 1024) -> tuple[str, list[AgentReply]]:
+                           reviewer_models: list[str],
+                           max_tokens: int = 1024) -> tuple[str, list[AgentReply], list[str]]:
     """Раздел 6 протокола: approve / approve_with_findings / reject. Любой reject — блокирует,
     расхождение не усредняется (голосов < 3 моделей просто не бывает большинства — решает наличие reject)."""
-    brief = (
-        f"Ревью артефакта задачи \"{task.id}\" ({task.goal}). Что сдали:\n{artifact_summary}\n\n"
-        "Оцени: закрывает ли это задачу, нет ли явных ошибок. В result JSON: "
-        '{"verdict": "approve|approve_with_findings|reject", "why": "..."}.'
-    )
-    replies = [
-        call_agent_any(gateway, [m, FALLBACK_MODEL] if m != FALLBACK_MODEL else [m],
-                        "reviewer", f"review-{task.id}", brief, max_tokens=max_tokens)
-        for m in reviewer_models
-    ]
-    verdicts = []
-    for r in replies:
-        try:
-            v = json.loads(r.result) if isinstance(r.result, str) else r.result
-            verdicts.append(v.get("verdict", "reject"))
-        except (json.JSONDecodeError, ValueError, TypeError):
-            verdicts.append("reject")  # нечитаемый ответ ревьюера — не молчаливое одобрение
-    if "reject" in verdicts:
+    # verdict/why описаны как поля верхнего уровня в contract.py::build_prompt (role="reviewer") —
+    # здесь только предмет ревью, схему не повторяем: повторение двух версий инструкции (тут JSON-в-result,
+    # там поле верхнего уровня) и путало живые модели, отсюда половина случаев "verdict отсутствует".
+    brief = f"Ревью артефакта задачи \"{task.id}\" ({task.goal}). Что сдали:\n{artifact_summary}\n\nОцени: закрывает ли это задачу, нет ли явных ошибок."
+    valid_verdicts = {"approve", "approve_with_findings", "reject"}
+
+    def ask(model: str) -> AgentReply:
+        return call_agent_any(gateway, [model, FALLBACK_MODEL] if model != FALLBACK_MODEL else [model],
+                               "reviewer", f"review-{task.id}", brief, max_tokens=max_tokens)
+
+    replies: list[AgentReply] = []
+    valid_verdicts_list, reasons = [], []
+    for m in reviewer_models:
+        r = ask(m)
+        v = r.raw.get("verdict")
+        if v not in valid_verdicts:
+            r = ask(m)  # одна попытка перезадать тому же ревьюеру, прежде чем считать голос потерянным
+            v = r.raw.get("verdict")
+        replies.append(r)
+        if v in valid_verdicts:
+            valid_verdicts_list.append(v)
+            reasons.append(r.result or "")
+        else:
+            # раздел 6 говорит про reject-голос, а не про немую модель — это ГОЛОС ПОТЕРЯН (abstain), не reject.
+            # Менеджер сам предложил эту схему после того, как один abstain душил approve от двух остальных.
+            reasons.append(f"ревьюер ({r.model}) дважды не вернул понятный verdict, голос не учтён: {(r.result or '')[:200]}")
+
+    if not valid_verdicts_list:
+        final = "reject"  # ни одного читаемого голоса вообще — не молчаливое одобрение
+    elif "reject" in valid_verdicts_list:
         final = "reject"
-    elif "approve_with_findings" in verdicts:
+    elif "approve_with_findings" in valid_verdicts_list:
         final = "approve_with_findings"
     else:
         final = "approve"
-    return final, replies
+    return final, replies, [r for r in reasons if r]
 
 
 def dispatcher_checker_needed(task: Task, wave_replies: list[AgentReply]) -> SpawnRequest | None:
@@ -243,22 +256,28 @@ class AcceptanceResult:
         return self.goal_met and self.ground_truth_ok
 
 
-def acceptor_check_goal(gateway, original_goal: str, board: Board, max_tokens: int = 2048) -> tuple[bool, str]:
-    summary = "\n".join(f"- {t.id} ({t.status}): {t.history[-1]['event'] if t.history else ''}"
-                         for t in board.tasks.values())
+def acceptor_check_goal(gateway, original_goal: str, board: Board, max_tokens: int = 4096) -> tuple[bool, str]:
+    # раньше сводка была одним словом ("reply"/"review") из последней записи history — приёмщик физически
+    # не мог сверить содержимое с целью. Теперь реальные пути и содержимое файлов, как у ревьюеров.
+    parts = [f"Исходная цель роя: {original_goal}\n"]
+    for t in board.tasks.values():
+        parts.append(f"- Задача \"{t.id}\" [{t.status}]: {t.goal}")
+        for a in t.artifacts:
+            if a.get("content"):
+                parts.append(f"  Файл {a.get('path')}:\n{a['content'][:3000]}")
+    summary = "\n".join(parts)
     brief = (
-        f"Исходная цель роя: {original_goal}\n\nИтог по задачам:\n{summary}\n\n"
+        f"{summary}\n\n"
         "Сверь результат с исходной ЦЕЛЬЮ, не со списком задач — задачи могли быть выполнены "
-        "формально и мимо цели. В result JSON: {\"goal_met\": bool, \"why\": \"...\"}."
+        "формально и мимо цели."
     )
     reply = call_agent_any(gateway, _with_fallback(*ACCEPTOR_MODELS), "acceptor", "accept-goal", brief, max_tokens=max_tokens)
     if reply.status != "done":
         return False, reply.raw.get("blocked_reason", "приёмщик не смог оценить")
-    try:
-        v = json.loads(reply.result) if isinstance(reply.result, str) else reply.result
-        return bool(v.get("goal_met")), v.get("why", "")
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return False, "приёмщик вернул нечитаемый вердикт"
+    v = reply.raw.get("goal_met")
+    if not isinstance(v, bool):
+        return False, f"приёмщик не вернул понятное goal_met ({v!r}): {(reply.result or '')[:300]}"
+    return v, reply.result or ""
 
 
 def acceptor_check_ground_truth(board: Board) -> tuple[bool, list[str]]:

@@ -142,6 +142,21 @@ def build_prompt(role: str, task_id: str, brief: str, extra_context: str = "") -
         '"tools_used": [...], "findings": [{"severity": "blocker|major|minor", "what": "...", "where": "...", "fix": "..."}], '
         '"assumptions": [...], "blocked_reason": "...", "self_check": {"goal_met": false, "why": "..."}}'
     )
+    reviewer_note = ""
+    if role == "acceptor":
+        reviewer_note = (
+            ' Добавь в этот же JSON-объект (не внутрь result, отдельным ключом верхнего уровня) поле '
+            '"goal_met": true|false. result — текстовое обоснование, обычным текстом, не JSON.'
+        )
+    if role == "reviewer":
+        # НЕ просить вложенный JSON внутри строки result — живые модели на этом сыпятся (вложенный
+        # JSON-в-JSON-строке), один нечитаемый голос из трёх молча считался reject. verdict — просто
+        # ещё одно поле ЭТОГО ЖЕ объекта верхнего уровня, отдельным ключом.
+        reviewer_note = (
+            ' Добавь в этот же JSON-объект (не внутрь result, отдельным ключом верхнего уровня) поле '
+            '"verdict": "approve" | "approve_with_findings" | "reject". result — текстовое обоснование '
+            'вердикта, обычным текстом, не JSON.'
+        )
     return (
         f"Ты — агент роя в роли {role}. task_id: {task_id}.\n\n"
         f"Задача:\n{scrubbed}{secret_note}\n\n"
@@ -150,7 +165,7 @@ def build_prompt(role: str, task_id: str, brief: str, extra_context: str = "") -
         f"опиши в result что именно нужно. Если задача невыполнима — status=\"blocked\" и заполни blocked_reason. "
         f"Если создаёшь или меняешь файл — artifacts[].content ОБЯЗАН содержать полный текст файла, "
         f"а не только путь: путь без содержимого при status=\"done\" не считается выполненной работой. "
-        f"findings — список ОБЪЕКТОВ по схеме выше, не голых строк."
+        f"findings — список ОБЪЕКТОВ по схеме выше, не голых строк.{reviewer_note}"
     )
 
 

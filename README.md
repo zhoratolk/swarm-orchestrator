@@ -21,6 +21,39 @@ python -m swarm.orchestrator run examples/example_task.yaml             # с р�
 
 Полная спека ролей — [`PROTOCOL.md`](PROTOCOL.md).
 
+## Запуск скилла в других чатах и проектах
+
+Просто открыть этот репозиторий в Claude Code — скилл подхватится сам (`.claude/skills/swarm-orchestrator/SKILL.md` уже в репо). Для остальных случаев:
+
+**Без скилла, из любого чата.** Скилл не обязателен — Claude Code (и просто ты сам) может запускать инструмент напрямую, если знает путь:
+
+```bash
+cd /путь/до/swarm-orchestrator && python -m swarm.orchestrator run examples/example_task.yaml
+```
+
+Скажи Claude в любой сессии: «есть swarm-orchestrator в `<путь>`, прогони на нём вот такую задачу» — этого достаточно, скилл только автоматизирует распознавание.
+
+**Глобальный скилл — работает во всех проектах и чатах на этой машине без копирования.** Клонировать репозиторий прямо в папку скиллов пользователя и положить туда же корневой `SKILL.md` (внутри репо он на три уровня глубже, с относительными путями `../../../`; для глобального расположения нужен вариант с путями от корня самого себя):
+
+```bash
+# bash / git bash
+git clone https://github.com/zhoratolk/swarm-orchestrator ~/.claude/skills/swarm-orchestrator
+cp ~/.claude/skills/swarm-orchestrator/.claude/skills/swarm-orchestrator/SKILL.md ~/.claude/skills/swarm-orchestrator/SKILL.md
+sed -i 's#\.\./\.\./\.\./##g' ~/.claude/skills/swarm-orchestrator/SKILL.md   # ../../../README.md -> README.md
+cd ~/.claude/skills/swarm-orchestrator && pip install -r requirements.txt && cp env.example .env   # вписать ключ самому
+```
+
+```powershell
+# PowerShell (Windows)
+git clone https://github.com/zhoratolk/swarm-orchestrator "$env:USERPROFILE\.claude\skills\swarm-orchestrator"
+$skill = "$env:USERPROFILE\.claude\skills\swarm-orchestrator"
+Copy-Item "$skill\.claude\skills\swarm-orchestrator\SKILL.md" "$skill\SKILL.md"
+(Get-Content "$skill\SKILL.md") -replace '\.\./\.\./\.\./', '' | Set-Content "$skill\SKILL.md"
+Set-Location $skill; pip install -r requirements.txt; Copy-Item env.example .env   # вписать ключ самому
+```
+
+После этого в любом проекте на машине фраза «запусти рой» и подобные (раздел `description` в `SKILL.md`) сами подтягивают скилл — копировать код в каждый проект не нужно.
+
 ## Устройство вкратце
 
 - **Менеджер** раскладывает цель на задачи, держит доску состояний, перепланирует при застое.

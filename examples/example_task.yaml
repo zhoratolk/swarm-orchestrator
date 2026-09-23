@@ -5,8 +5,8 @@
 # тем как поверить, что задача сделана. Без verify_cmd приёмка идёт только по слову агента.
 
 goal: >
-  Написать функцию is_prime(n) на Python с юнит-тестами и коротким README,
-  положить в ./out/prime.py и ./out/test_prime.py.
+  Написать функцию is_prime(n) на Python с юнит-тестами, положить
+  в ./out/prime.py и ./out/test_prime.py.
 
 allow_paid: false        # платные модели (раздел 3) не трогать без явного true
 cost_cap: 1.00            # $ — предохранитель, раздел 8

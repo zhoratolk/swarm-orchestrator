@@ -42,7 +42,59 @@ def load_config(path: Path) -> dict:
     return cfg
 
 
-def run_wave(gateway, requests_: list[SpawnRequest], task: Task, models_of, workers: int = 6) -> list[AgentReply]:
+def write_artifacts(artifacts: list[dict]) -> None:
+    """Реально кладёт то, что агент заявил в artifacts[], на диск (относительно текущей директории).
+
+    Раньше этого шага не было вообще: агенты честно писали содержимое файла в JSON, ревьюеры его видели
+    (dep_context/сводка для ревью читают task.artifacts в памяти), а на диске ничего не появлялось — из-за
+    этого verify_cmd падал на КАЖДОМ прогоне, независимо от качества кода. Путь с .. или абсолютный —
+    пропускаем, не вылезаем за пределы рабочей директории."""
+    cwd = Path.cwd().resolve()
+    for a in artifacts:
+        path = a.get("path")
+        if not path:
+            continue
+        dest = (cwd / path).resolve()
+        if cwd not in dest.parents and dest != cwd:
+            log.warning("артефакт вне рабочей директории пропущен: %s", path)
+            continue
+        action = a.get("action", "create")
+        if action == "delete":
+            if dest.exists():
+                dest.unlink()
+            continue
+        content = a.get("content", "")
+        if not content:
+            continue  # путь без содержимого — нечего писать, не создаём пустышку
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+        log.info("артефакт записан: %s (%d байт)", dest.relative_to(cwd), len(content))
+
+
+def dep_context(board: Board, task: Task) -> str:
+    """Что реально сделали задачи-зависимости — путь и содержимое файлов, не только их цель.
+
+    Раньше зависимая задача видела только текст своей собственной цели: "tests" зависит от "implement",
+    но не получала ни пути файла, ни сигнатуры функции, ни того, что implement реально написал — только
+    свою же фразу из YAML. Реализатор честно отвечал needs_info, спрашивая то, что уже есть на доске."""
+    parts = []
+    for dep_id in task.deps:
+        dt = board.tasks.get(dep_id)
+        if not dt:
+            continue
+        for a in dt.artifacts:
+            if a.get("content"):
+                parts.append(f"Из задачи \"{dep_id}\" ({dep_id}), файл {a.get('path')}:\n{a['content'][:3000]}")
+        if not dt.artifacts and dt.history:
+            last_result = next((h.get("event") for h in reversed(dt.history) if h.get("event") == "reply"), None)
+            if last_result:
+                parts.append(f"Задача \"{dep_id}\" отмечена done, но артефактов с содержимым нет — см. её result в history.")
+    return "\n\n".join(parts)
+
+
+def run_wave(gateway, requests_: list[SpawnRequest], task: Task, board: Board, models_of,
+             workers: int = 6) -> list[AgentReply]:
+    extra = dep_context(board, task)
     calls = []
     for req in requests_:
         models = models_of(req.role)
@@ -59,7 +111,7 @@ def run_wave(gateway, requests_: list[SpawnRequest], task: Task, models_of, work
         # у каждого вызова свой фолбэк (раздел 11) — недоступность одной модели не съедает волну
         futures = {
             pool.submit(call_agent_any, gateway, [model, FALLBACK_MODEL] if model != FALLBACK_MODEL else [model],
-                        role, task.id, task.goal): (role, model)
+                        role, task.id, task.brief(), extra): (role, model)
             for role, model in calls
         }
         for fut in as_completed(futures):
@@ -100,7 +152,7 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
         return
 
     task.status = "in_progress"
-    replies = run_wave(gateway, approved, task, models_of)
+    replies = run_wave(gateway, approved, task, board, models_of)
     if not replies:
         task.status = "blocked"
         task.findings.append({"severity": "blocker", "what": "волна не вернула ни одного ответа",
@@ -111,6 +163,8 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
         task.artifacts += r.artifacts
         task.findings += r.findings
         task.log("reply", role=r.role_asked, model=r.model, status=r.status, confidence=r.confidence)
+    for r in replies:
+        write_artifacts(r.artifacts)
 
     checker_req = dispatcher_checker_needed(task, replies)
     if checker_req:
@@ -120,7 +174,7 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
         if verdict.approved_count > 0:
             checker_replies = run_wave(gateway, [SpawnRequest("checker", verdict.approved_count,
                                                                 checker_req.reason, task.id)],
-                                        task, models_of)
+                                        task, board, models_of)
             for r in checker_replies:
                 task.findings += r.findings
                 task.log("checker_reply", model=r.model, status=r.status)
@@ -144,17 +198,20 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
                     if a.get("content"):
                         parts.append(f"--- {a.get('path')} ---\n{a['content'][:4000]}")
             summary = "\n\n".join(parts)
-            final_verdict, review_replies = review_quorum_verdict(
+            final_verdict, review_replies, reasons = review_quorum_verdict(
                 gateway, task, summary, reviewer_models[:verdict.approved_count])
             # models в логе — кто РЕАЛЬНО ответил (после фолбэка), не то, что запрашивали
-            task.log("review", verdict=final_verdict, models=[r.model for r in review_replies])
+            task.log("review", verdict=final_verdict, models=[r.model for r in review_replies], reasons=reasons)
             if final_verdict == "reject":
                 task.status = "blocked"
+                reason_text = "; ".join(reasons) or "ревьюеры не объяснили reject"
                 task.findings.append({
                     "severity": "blocker", "what": "ревью отклонило артефакт (кворум reject)",
-                    "where": task.id,
-                    "fix": "; ".join(r.result for r in review_replies if r.result) or "см. review в history",
+                    "where": task.id, "fix": reason_text,
                 })
+                # это ГЛАВНАЯ причина застоя раньше: причину отклонения теряли при переоткрытии задачи —
+                # исполнитель на следующем заходе писал то же самое вслепую. feedback переживает reset findings.
+                task.feedback.append(f"ревью отклонило: {reason_text}")
                 return
             if final_verdict == "approve_with_findings":
                 for r in review_replies:
@@ -162,8 +219,20 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
 
     if any(r.status == "done" for r in replies):
         task.status = "done"
-    else:
-        task.status = "needs_review"
+        return
+
+    # needs_info от исполнителя раньше зависал тупиком: нет findings -> replan-ветка его не видела,
+    # ready() тоже не подбирает needs_review -> задача молча стояла до конца прогона. Заводим через
+    # тот же blocked-путь, что и reject, с тем же feedback-каналом, чтобы Реализатор на новом заходе
+    # увидел, чего именно не хватило, а не повторял то же самое вслепую.
+    asks = [r.result for r in replies if r.status == "needs_info" and r.result]
+    task.status = "blocked"
+    task.findings.append({
+        "severity": "blocker", "what": "исполнитель просит уточнение (needs_info)",
+        "where": task.id, "fix": "; ".join(asks) or "см. reply в history",
+    })
+    if asks:
+        task.feedback.append("реализатору не хватило: " + "; ".join(asks))
 
 
 def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
@@ -226,13 +295,15 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
             break
 
         if blockers and board.any_permanently_blocked():
-            summary = "; ".join(f"{b.get('what')} ({b.get('where')})" for b in blockers[:5])
+            # раньше сюда шли только what/where — reject reject reject без сути; менеджер честно отвечал
+            # "недостаточно контекста" и цикл топтался. Теперь fix/причина едет тоже.
+            summary = "; ".join(f"{b.get('what')} ({b.get('where')}): {b.get('fix', '')}" for b in blockers[:5])
             decision = manager_replan(gateway, board, summary)
             log.info("менеджер: %s", decision)
             for t in board.tasks.values():
                 if t.status == "blocked":
                     t.status = "queued"
-                    t.findings = []
+                    t.findings = []  # findings — временный разбор этого захода, feedback остаётся и едет дальше
             board.save()
 
         if board.all_done():
