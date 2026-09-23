@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -52,7 +54,15 @@ class Board:
 
     def save(self):
         data = {tid: asdict(t) for tid, t in self.tasks.items()}
-        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        fd, name = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                json.dump(data, out, ensure_ascii=False, indent=2)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(name, self.path)
+        finally:
+            Path(name).unlink(missing_ok=True)
 
     def ready(self) -> list[Task]:
         """Задачи в queued, у которых все зависимости done."""
