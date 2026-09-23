@@ -16,6 +16,12 @@ from .contract import call_agent, call_agent_any, AgentReply
 MANAGER_MODEL = "claude-opus-5.5"
 DISPATCHER_MODEL = "gpt-6-luna"
 AUDITOR_LLM_MODEL = "nemotron-3-ultra-550b-a55b"
+# У AUDITOR_LLM_MODEL нет собственного фолбэка отдельно от общего FALLBACK_MODEL — а это одна и та же
+# модель. Живой прогон: nemotron ловит устойчивый 429 (её же используют как фолбэк ВСЕ роли, поэтому
+# она перегружена чаще прочих), выпадает из пула, и Ревизор спавна остаётся вообще без модели —
+# каждый пограничный спавн (в т.ч. законный повтор после честного reject) молча отклоняется с
+# "все модели недоступны", застой гарантирован. Второй, РЕАЛЬНО другой провайдер как подстраховка.
+AUDITOR_FALLBACK_MODEL = "gpt-5.6-luna"
 ACCEPTOR_MODELS = ("claude-opus-5.5", "gpt-6-sol")
 
 # Раздел 11: единственная модель без геоблоков на некоторых сетях (проверено эмпирически —
@@ -146,8 +152,8 @@ class SpawnAuditor:
             "отклонена (см. прошлые попытки выше) — новый спавн для исправления оправдан. В result "
             'верни JSON: {"approve_count": N, "why": "..."} — N не больше запрошенного, 0 если не обосновано.'
         )
-        reply = call_agent_any(self.gateway, _with_fallback(AUDITOR_LLM_MODEL), "checker", f"audit-{task.id}-{req.role}",
-                            brief, max_tokens=2048)
+        reply = call_agent_any(self.gateway, _with_fallback(AUDITOR_LLM_MODEL, AUDITOR_FALLBACK_MODEL),
+                            "checker", f"audit-{task.id}-{req.role}", brief, max_tokens=2048)
         if reply.status != "done":
             return AuditVerdict(0, f"ревизор не смог решить: {reply.result or reply.raw.get('blocked_reason')}")
         try:
