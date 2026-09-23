@@ -330,6 +330,23 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
         board = Board.new(tasks, board_path)
     board.save()
 
+    def replan_and_requeue(reason: str) -> bool:
+        """Переоткрывает все blocked-задачи через Менеджера. True — что-то реально переоткрыто."""
+        blockers = board.blockers()
+        if not (blockers and board.any_permanently_blocked()):
+            return False
+        summary = "; ".join(f"{b.get('what')} ({b.get('where')}): {b.get('fix', '')}" for b in blockers[:5])
+        decision = manager_replan(gateway, board, summary, repo_context)
+        log.info("менеджер (%s): %s", reason, decision)
+        requeued = False
+        for t in board.tasks.values():
+            if t.status == "blocked":
+                t.status = "queued"
+                t.findings = []  # findings — временный разбор этого захода, feedback остаётся и едет дальше
+                requeued = True
+        board.save()
+        return requeued
+
     auditor = SpawnAuditor(gateway, cfg["cost_cap"])
     stagnant_rounds = 0
     prev_blocker_count = None
@@ -340,9 +357,18 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
         if not ready and not board.pending():
             break
         if not ready:
-            log.warning("нет готовых задач, но есть незакрытые (%d) — вероятно, все blocked",
-                        len(board.pending()))
-            break
+            # Раньше это сразу break — на --resume в blocked-задачу (в т.ч. ту, что упала на
+            # инфраструктурном сбое типа временно недоступной модели, а не на реальном браке) цикл
+            # сдавался на первой же итерации, ни разу не дав Менеджеру шанс переоткрыть её: обычная
+            # reset-ветка ниже по коду достижима только ПОСЛЕ обработки хотя бы одной ready-задачи
+            # в этой же итерации, а тут ready пуст с самого начала.
+            if not replan_and_requeue("нет ready-задач на входе итерации"):
+                log.warning("нет готовых задач, но есть незакрытые (%d) — вероятно, все blocked",
+                            len(board.pending()))
+                break
+            ready = board.ready()
+            if not ready:
+                break
 
         for task in ready:
             log.info("задача %s: %s", task.id, task.goal[:120])
@@ -365,17 +391,7 @@ def run(config_path: Path, run_dir: Path, dry_run: bool, resume: bool):
             log.error("бюджет исчерпан: $%.4f >= $%.4f — остановка", usage.actual_cost, cfg["cost_cap"])
             break
 
-        if blockers and board.any_permanently_blocked():
-            # раньше сюда шли только what/where — reject reject reject без сути; менеджер честно отвечал
-            # "недостаточно контекста" и цикл топтался. Теперь fix/причина едет тоже.
-            summary = "; ".join(f"{b.get('what')} ({b.get('where')}): {b.get('fix', '')}" for b in blockers[:5])
-            decision = manager_replan(gateway, board, summary, repo_context)
-            log.info("менеджер: %s", decision)
-            for t in board.tasks.values():
-                if t.status == "blocked":
-                    t.status = "queued"
-                    t.findings = []  # findings — временный разбор этого захода, feedback остаётся и едет дальше
-            board.save()
+        replan_and_requeue("застой/reject после обработки ready-задач")
 
         if board.all_done():
             # Раньше приёмка (реальный verify_cmd) шла ПОСЛЕ выхода из цикла — провал ground truth
