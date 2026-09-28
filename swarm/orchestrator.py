@@ -198,6 +198,7 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
     task.log("dispatch")
     plan = dispatcher_plan(gateway, task, board, repo_context)
     approved: list[SpawnRequest] = []
+    rejections: list[str] = []
     for req in plan:
         verdict = auditor.review(req, task)
         task.log("audit", role=req.role, requested=req.count, approved=verdict.approved_count, note=verdict.note)
@@ -205,11 +206,18 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
             approved.append(SpawnRequest(req.role, verdict.approved_count, req.reason, task.id))
         else:
             log.info("ревизор отклонил спавн %s x%d на %s: %s", req.role, req.count, task.id, verdict.note)
+            rejections.append(f"{req.role} x{req.count} — {verdict.note[:200]}")
 
     if not approved:
         task.status = "blocked"
         task.findings.append({"severity": "blocker", "what": "ревизор не одобрил ни один спавн",
                                "where": task.id, "fix": "пересмотреть задачу или лимиты ревизора"})
+        # Живой прогон (shakedown-game, 2026-09-24): эта ветка не писала task.feedback, только
+        # findings (которые manager_replan обнуляет при переоткрытии). На повторе Ревизор видел
+        # already>0 без единого слова о том, ПОЧЕМУ была предыдущая попытка — и честно отказывал
+        # "данных об отклонении нет", хотя отклонение только что было. feedback переживает reset,
+        # findings — нет; без этой строки ретрай после любого auditor-reject тоже стагнирует.
+        task.feedback.append("ревизор отклонил предыдущий спавн: " + "; ".join(rejections))
         return
 
     task.status = "in_progress"
@@ -218,6 +226,12 @@ def process_task(gateway, auditor: SpawnAuditor, task: Task, board: Board,
         task.status = "blocked"
         task.findings.append({"severity": "blocker", "what": "волна не вернула ни одного ответа",
                                "where": task.id, "fix": "проверить доступность моделей"})
+        # Тот же класс бага, что и в ветке "не одобрил спавн" выше: без записи в feedback повтор
+        # после инфраструктурного отказа (все модели волны были заняты/недоступны в моменте, не
+        # содержательный reject) выглядит для Ревизора на следующей итерации как немотивированный
+        # повторный спавн — реальный кейс, поймавший faction_hull_visual/perf_100x100 в 2 живых
+        # прогонах подряд, стагнация за 3 итерации на КАЖДОЙ такой задаче.
+        task.feedback.append("волна не вернула ни одного ответа (модели были недоступны) — повтор оправдан")
         return
 
     for r in replies:
