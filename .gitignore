@@ -13,3 +13,6 @@ report.md
 .pytest_tmp/
 .pytest_cache/
 .coverage
+
+# run configs for private projects - never commit
+tasks/
